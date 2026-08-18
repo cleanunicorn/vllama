@@ -20,6 +20,7 @@ LEGACY_CONFIG_PATH = Path.home() / ".config" / "vllama" / "config.toml"
 DEFAULT_MODELS_DIR = Path.home() / ".local" / "share" / "drove" / "models"
 DEFAULT_SESSIONS_DIR = Path.home() / ".local" / "share" / "drove" / "sessions"
 DEFAULT_OBSERVE_DIR = Path.home() / ".local" / "share" / "drove" / "observe"
+DEFAULT_PROMPT_CACHE_DIR = Path.home() / ".local" / "share" / "drove" / "prompt-cache"
 
 # Module-level mutable so load_config() can point to a custom path
 _config_path: Path = DEFAULT_CONFIG_PATH
@@ -94,6 +95,13 @@ class Config(BaseSettings):
     idle_timeout_seconds: int = 1800  # 30 minutes
     max_loaded_models: int = 1
     max_memory: str = "0"  # combined memory budget for loaded models, e.g. "24GB"; "0" = unlimited
+    # Persist each model's prompt (KV) cache to disk across idle shutdowns, so a
+    # woken model does not have to re-process a prompt it already saw. On by
+    # default; the TTL is what keeps the cache directory from growing forever.
+    prompt_cache: bool = True
+    prompt_cache_dir: Path = DEFAULT_PROMPT_CACHE_DIR
+    prompt_cache_ttl_seconds: int = 3600  # discard cache files older than this; 0 = never expire
+    prompt_cache_timeout_seconds: int = 60  # max wait for a single save/restore call
     llama_server_host: str = "127.0.0.1"
     tui_theme: str = "textual-dark"
 
@@ -111,7 +119,7 @@ class Config(BaseSettings):
         # Priority: init kwargs > env vars > TOML file > defaults
         return (init_settings, env_settings, TomlConfigSettingsSource(settings_cls))
 
-    @field_validator("models_dir", "sessions_dir", "observe_dir", mode="before")
+    @field_validator("models_dir", "sessions_dir", "observe_dir", "prompt_cache_dir", mode="before")
     @classmethod
     def expand_path(cls, v: Any) -> Path:
         return Path(v).expanduser()
@@ -142,6 +150,10 @@ class Config(BaseSettings):
             "idle_timeout_seconds": self.idle_timeout_seconds,
             "max_loaded_models": self.max_loaded_models,
             "max_memory": self.max_memory,
+            "prompt_cache": self.prompt_cache,
+            "prompt_cache_dir": str(self.prompt_cache_dir),
+            "prompt_cache_ttl_seconds": self.prompt_cache_ttl_seconds,
+            "prompt_cache_timeout_seconds": self.prompt_cache_timeout_seconds,
             "llama_server_host": self.llama_server_host,
             "tui_theme": self.tui_theme,
             "llama_server": {

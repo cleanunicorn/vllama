@@ -73,6 +73,7 @@ The model loads on that first request and unloads itself after the idle timeout.
 |--|--|
 | 💤 **Lazy lifecycle** | Backends start on the first request and stop after an idle timeout — nothing runs while nothing is asking. |
 | 🧠 **Memory-aware eviction** | Keep multiple models hot within a `max_memory` budget; the least-recently-used idle model is evicted to make room. |
+| ⚡ **Prompt cache that survives sleep** | A woken model picks up the KV cache it had before it went idle, instead of re-processing the prompt. |
 | 🔌 **OpenAI-compatible** | Drop-in for any OpenAI SDK — `/v1/chat/completions`, `/v1/models`, `/v1/audio/transcriptions`. |
 | 📝 **Text generation** | Any GGUF model from HuggingFace, served through `llama-server` with per-model flags. |
 | 👁️ **Vision / multimodal** | Multimodal GGUF models with an `mmproj` projector are auto-detected and wired up on download. |

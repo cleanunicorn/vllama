@@ -122,3 +122,62 @@ def test_set_model_config_key_accepts_valid_backend(tmp_path: Path) -> None:
     model = fake_model(tmp_path)
     updated = set_model_config_key(model, "backend", "asr")
     assert updated.backend == "asr"
+
+
+# ── llama-server argument mapping ─────────────────────────────────────────────
+
+
+def test_prompt_cache_flags_map_to_llama_args() -> None:
+    args = ModelConfig(cache_reuse=256, cache_ram=16384, ctx_checkpoints=8).to_llama_args()
+    assert "--cache-reuse" in args
+    assert args[args.index("--cache-reuse") + 1] == "256"
+    assert args[args.index("--cache-ram") + 1] == "16384"
+    assert args[args.index("--ctx-checkpoints") + 1] == "8"
+
+
+def test_negatable_bools_emit_the_no_variant_when_false() -> None:
+    args = ModelConfig(cache_prompt=False, context_shift=False).to_llama_args()
+    assert "--no-cache-prompt" in args
+    assert "--no-context-shift" in args
+    assert "--cache-prompt" not in args
+
+
+def test_negatable_bools_emit_the_plain_flag_when_true() -> None:
+    args = ModelConfig(cache_prompt=True, context_shift=True).to_llama_args()
+    assert args.count("--cache-prompt") == 1
+    assert args.count("--context-shift") == 1
+    assert not any(a.startswith("--no-") for a in args)
+
+
+def test_plain_bool_is_omitted_when_false() -> None:
+    assert ModelConfig(swa_full=False).to_llama_args() == []
+    assert ModelConfig(swa_full=True).to_llama_args() == ["--swa-full"]
+
+
+def test_n_parallel_uses_the_parallel_flag() -> None:
+    """llama-server rejects --n-parallel outright, so the key must be remapped."""
+    args = ModelConfig(n_parallel=4).to_llama_args()
+    assert args == ["--parallel", "4"]
+
+
+def test_extra_args_are_appended_last() -> None:
+    args = ModelConfig(ctx_size=4096, extra_args=["--cache-reuse", "512"]).to_llama_args()
+    assert args[:2] == ["--ctx-size", "4096"]
+    assert args[-2:] == ["--cache-reuse", "512"]
+
+
+def test_extra_args_is_never_emitted_as_a_flag() -> None:
+    assert "--extra-args" not in ModelConfig(extra_args=["--verbose"]).to_llama_args()
+
+
+def test_set_extra_args_splits_shell_style(tmp_path: Path) -> None:
+    model = fake_model(tmp_path)
+    cfg = set_model_config_key(model, "extra_args", "--lora /models/a.gguf")
+    assert cfg.extra_args == ["--lora", "/models/a.gguf"]
+    assert load_model_config(model).extra_args == ["--lora", "/models/a.gguf"]
+
+
+def test_set_int_and_bool_cache_keys(tmp_path: Path) -> None:
+    model = fake_model(tmp_path)
+    assert set_model_config_key(model, "cache_reuse", "256").cache_reuse == 256
+    assert set_model_config_key(model, "cache_prompt", "false").cache_prompt is False

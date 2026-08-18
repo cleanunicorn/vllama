@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import logging
 import re
@@ -20,8 +21,9 @@ import psutil
 if TYPE_CHECKING:
     from drove.model_config import ModelConfig
 
-from drove.backend import BACKEND_ASR, detect_backend, infer_asr_model_type
+from drove.backend import BACKEND_ASR, BACKEND_LLAMA, detect_backend, infer_asr_model_type
 from drove.config import Config
+from drove.gguf import uses_sliding_window_attention
 from drove.model_config import (
     config_path_for_model,
     global_config_path,
@@ -39,6 +41,22 @@ HEALTH_CHECK_INTERVAL = 0.5  # seconds between health poll attempts
 _STDERR_MAX_BYTES = 256 * 1024  # keep last 256 KB of stderr
 
 _GGUF_SHARD_RE = re.compile(r"^(.+)-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
+
+_PROMPT_CACHE_GLOB = "slot-*.bin"
+_PROMPT_CACHE_FILE_RE = re.compile(r"^slot-(\d+)\.bin$")
+_PROMPT_CACHE_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _prompt_cache_slug(model_name: str) -> str:
+    """Return a filesystem-safe directory name for a model's prompt cache.
+
+    Model names contain path separators ("unsloth/Qwen3-8B-GGUF"), so they are
+    sanitized and suffixed with a short digest of the original name to keep
+    two models that sanitize to the same string apart.
+    """
+    safe = _PROMPT_CACHE_UNSAFE_RE.sub("_", model_name).strip("_") or "model"
+    digest = hashlib.sha256(model_name.encode()).hexdigest()[:8]
+    return f"{safe}-{digest}"
 
 
 def _estimate_model_memory(model_path: Path) -> int:
@@ -75,11 +93,13 @@ class _ModelInstance:
         port: int,
         model_path: Path,
         config_mtimes: tuple[float, float],
+        backend: str = BACKEND_LLAMA,
     ) -> None:
         self.model_name = model_name
         self.process = process
         self.port = port
         self.model_path = model_path
+        self.backend = backend
         self.config_mtimes = config_mtimes  # (per-model mtime, global mtime) at startup
         self.needs_restart: bool = False
         self.est_memory_bytes: int = 0
@@ -149,6 +169,8 @@ class ServerManager:
         self._instances: dict[str, _ModelInstance] = {}
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
+        # (path, mtime) → whether that GGUF uses sliding-window attention.
+        self._swa_cache: dict[tuple[str, float], bool | None] = {}
 
     @property
     def is_running(self) -> bool:
@@ -407,6 +429,7 @@ class ServerManager:
         backend = detect_backend(model_path, model_cfg)
 
         port = _find_free_port()
+        slot_save_path: Path | None = None
         if backend == BACKEND_ASR:
             cmd = self._build_asr_command(model_name, model_path, model_cfg, port)
         else:
@@ -416,7 +439,14 @@ class ServerManager:
                     f"llama-server binary '{binary}' not found on PATH. "
                     "Install llama.cpp or set 'llama_server_bin' in config."
                 )
-            cmd = [binary, *self._build_args(model_path, model_cfg, port)]
+            slot_save_path = self._prepare_prompt_cache_dir(model_name)
+            uses_swa = False
+            if slot_save_path is not None:
+                uses_swa = bool(await self._detect_sliding_window(model_path))
+            cmd = [
+                binary,
+                *self._build_args(model_path, model_cfg, port, slot_save_path, uses_swa),
+            ]
 
         logger.info("Starting %s backend: %s", backend, " ".join(cmd))
         process = await asyncio.create_subprocess_exec(
@@ -426,7 +456,7 @@ class ServerManager:
         )
 
         config_mtimes = self._get_config_mtimes(model_path)
-        inst = _ModelInstance(model_name, process, port, model_path, config_mtimes)
+        inst = _ModelInstance(model_name, process, port, model_path, config_mtimes, backend)
         inst.est_memory_bytes = _estimate_model_memory(model_path)
         inst.start_stderr_reader()
         self._instances[model_name] = inst
@@ -438,12 +468,18 @@ class ServerManager:
             await self._stop_instance(model_name)
             raise
 
+        if slot_save_path is not None:
+            await self._restore_prompt_cache(inst, slot_save_path)
+
         self._start_idle_watcher(model_name)
         logger.info("Backend ready (model=%s, backend=%s, port=%d)", model_name, backend, port)
 
     async def _stop_instance(self, model_name: str) -> None:
         task = self._idle_tasks.pop(model_name, None)
-        if task is not None:
+        # The idle watcher calls this from inside its own task: cancelling it
+        # here would raise CancelledError at the next await and leave the
+        # process running. It exits on its own right after this returns.
+        if task is not None and task is not asyncio.current_task():
             task.cancel()
 
         inst = self._instances.pop(model_name, None)
@@ -452,6 +488,8 @@ class ServerManager:
 
         if not inst.is_running:
             return
+
+        await self._save_prompt_cache(inst)
 
         logger.info("Stopping llama-server (model=%s, pid=%d)", model_name, inst.process.pid)
         try:
@@ -492,7 +530,14 @@ class ServerManager:
             msg += f"\nstderr (last lines):\n{_tail(stderr, 30)}"
         raise TimeoutError(msg)
 
-    def _build_args(self, model_path: Path, model_cfg: ModelConfig, port: int) -> list[str]:
+    def _build_args(
+        self,
+        model_path: Path,
+        model_cfg: ModelConfig,
+        port: int,
+        slot_save_path: Path | None = None,
+        uses_swa: bool = False,
+    ) -> list[str]:
         from drove.model_config import ModelConfig  # local import to avoid circular
 
         # Start with global defaults from config.toml [llama_server]
@@ -518,6 +563,18 @@ class ServerManager:
             "--port",
             str(port),
         ]
+        if slot_save_path is not None:
+            args.extend(["--slot-save-path", f"{slot_save_path}/"])
+            # A restored KV cache is only reusable if the whole cache was
+            # serialized, and sliding-window models keep only the window unless
+            # the full SWA cache is enabled. Measured on gemma-4-E4B: without
+            # --swa-full a restored cache produced zero reuse (23 tokens
+            # re-processed); with it, 22 of 23 tokens came from the cache. It
+            # costs memory (5.8 GB → 7.0 GB at 32k context on that model), so it
+            # is only added for models that actually use SWA. An explicit
+            # swa_full in the model config still wins.
+            if uses_swa and merged.swa_full is None:
+                merged = merged.model_copy(update={"swa_full": True})
         args.extend(merged.to_llama_args())
         return args
 
@@ -564,6 +621,193 @@ class ServerManager:
             f"Cannot determine the ASR model type for '{model_name}'. "
             f"Set it explicitly with: drove models config '{model_name}' asr_model <type> "
             "(e.g. nemo-parakeet-tdt-0.6b-v3)"
+        )
+
+    # ── Prompt cache persistence ──────────────────────────────────────────────
+    #
+    # llama-server keeps a prompt (KV) cache in RAM, which dies with the
+    # process — and drove stops that process on every idle timeout. With
+    # ``prompt_cache`` enabled, each slot's KV cache is written to disk before
+    # the process is stopped and restored right after the next one is healthy,
+    # so a woken model does not re-process a prompt it already saw. Cache files
+    # older than ``prompt_cache_ttl_seconds`` are discarded before startup.
+    #
+    # None of this is load-bearing: every failure path degrades to "no cache".
+
+    def _prompt_cache_dir_for(self, model_name: str) -> Path:
+        """Return the directory holding a model's saved slot caches."""
+        return self._config.prompt_cache_dir / _prompt_cache_slug(model_name)
+
+    def _prepare_prompt_cache_dir(self, model_name: str) -> Path | None:
+        """Create the model's slot-cache directory and drop expired files.
+
+        Returns None when the prompt cache is disabled or the directory cannot
+        be created, in which case ``--slot-save-path`` is not passed at all.
+        """
+        if not self._config.prompt_cache:
+            return None
+        cache_dir = self._prompt_cache_dir_for(model_name)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("Prompt cache disabled for model=%s: %s", model_name, e)
+            return None
+        self._prune_expired(cache_dir)
+        return cache_dir
+
+    def _prune_expired(self, cache_dir: Path) -> None:
+        """Delete slot cache files older than the configured TTL (0 = never)."""
+        ttl = self._config.prompt_cache_ttl_seconds
+        if ttl <= 0:
+            return
+        cutoff = time.time() - ttl
+        for path in cache_dir.glob(_PROMPT_CACHE_GLOB):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    logger.info("Discarded expired prompt cache %s", path)
+            except OSError:
+                continue
+
+    def prune_prompt_cache(self) -> None:
+        """Drop expired slot caches for every model. Safe to call at any time."""
+        if not self._config.prompt_cache:
+            return
+        root = self._config.prompt_cache_dir
+        if not root.is_dir():
+            return
+        for cache_dir in root.iterdir():
+            if cache_dir.is_dir():
+                self._prune_expired(cache_dir)
+
+    async def _detect_sliding_window(self, model_path: Path) -> bool | None:
+        """Whether this GGUF uses sliding-window attention (None = could not tell).
+
+        Reading the header walks the metadata block — cheap for a model that
+        declares a window early, but a model without one is only proven negative
+        after the tokenizer vocabulary, so this runs off the event loop and the
+        answer is cached per file revision.
+        """
+        try:
+            key = (str(model_path), model_path.stat().st_mtime)
+        except OSError:
+            return None
+        if key not in self._swa_cache:
+            self._swa_cache[key] = await asyncio.to_thread(
+                uses_sliding_window_attention, model_path
+            )
+            if self._swa_cache[key] is None:
+                logger.info(
+                    "Could not read GGUF metadata for %s; not enabling --swa-full, "
+                    "which may leave the prompt cache unusable if this model uses SWA",
+                    model_path.name,
+                )
+        return self._swa_cache[key]
+
+    async def _save_prompt_cache(self, inst: _ModelInstance) -> None:
+        """Write each idle slot's KV cache to disk before the process is stopped."""
+        if not self._config.prompt_cache or inst.backend != BACKEND_LLAMA:
+            return
+        base = f"http://{self._config.llama_server_host}:{inst.port}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._config.prompt_cache_timeout_seconds
+            ) as client:
+                resp = await client.get(f"{base}/slots")
+                resp.raise_for_status()
+                slots = resp.json()
+                if not isinstance(slots, list):
+                    return
+                for slot in slots:
+                    if isinstance(slot, dict):
+                        await self._save_slot(client, base, inst.model_name, slot)
+        except (httpx.HTTPError, OSError, ValueError) as e:
+            logger.warning("Could not save prompt cache for model=%s: %s", inst.model_name, e)
+
+    async def _save_slot(
+        self,
+        client: httpx.AsyncClient,
+        base: str,
+        model_name: str,
+        slot: dict[str, object],
+    ) -> None:
+        """Save one slot's KV cache, dropping the file when the slot was empty."""
+        slot_id = slot.get("id")
+        if not isinstance(slot_id, int) or slot.get("is_processing"):
+            return
+        filename = f"slot-{slot_id}.bin"
+        resp = await client.post(
+            f"{base}/slots/{slot_id}",
+            params={"action": "save"},
+            json={"filename": filename},
+        )
+        if resp.status_code != 200:
+            logger.warning(
+                "Prompt cache save failed for model=%s slot=%d: HTTP %d",
+                model_name,
+                slot_id,
+                resp.status_code,
+            )
+            return
+        body = resp.json()
+        n_saved = body.get("n_saved", 0) if isinstance(body, dict) else 0
+        if not n_saved:
+            # Empty slot: drop the file so the next start skips a pointless restore.
+            (self._prompt_cache_dir_for(model_name) / filename).unlink(missing_ok=True)
+            return
+        logger.info(
+            "Saved prompt cache for model=%s (slot=%d, %s tokens)", model_name, slot_id, n_saved
+        )
+
+    async def _restore_prompt_cache(self, inst: _ModelInstance, cache_dir: Path) -> None:
+        """Load previously saved slot caches into a freshly started server."""
+        files = sorted(cache_dir.glob(_PROMPT_CACHE_GLOB))
+        if not files:
+            return
+        base = f"http://{self._config.llama_server_host}:{inst.port}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._config.prompt_cache_timeout_seconds
+            ) as client:
+                for path in files:
+                    match = _PROMPT_CACHE_FILE_RE.match(path.name)
+                    if match is None:
+                        continue
+                    await self._restore_slot(client, base, inst.model_name, path, int(match[1]))
+        except (httpx.HTTPError, OSError, ValueError) as e:
+            logger.warning("Could not restore prompt cache for model=%s: %s", inst.model_name, e)
+
+    async def _restore_slot(
+        self,
+        client: httpx.AsyncClient,
+        base: str,
+        model_name: str,
+        path: Path,
+        slot_id: int,
+    ) -> None:
+        """Restore one slot cache, deleting the file when the server rejects it.
+
+        A rejection means the file no longer matches the server (context size,
+        KV cache type or slot count changed), so it is dead weight from here on.
+        """
+        resp = await client.post(
+            f"{base}/slots/{slot_id}",
+            params={"action": "restore"},
+            json={"filename": path.name},
+        )
+        if resp.status_code != 200:
+            logger.info(
+                "Discarding unusable prompt cache %s (HTTP %d)", path.name, resp.status_code
+            )
+            path.unlink(missing_ok=True)
+            return
+        body = resp.json()
+        n_restored = body.get("n_restored", 0) if isinstance(body, dict) else 0
+        logger.info(
+            "Restored prompt cache for model=%s (slot=%d, %s tokens)",
+            model_name,
+            slot_id,
+            n_restored,
         )
 
     def _resolve_model(self, model_name: str) -> Path:
