@@ -1,12 +1,12 @@
 # Release process
 
-This document describes how a new version of `drove` is cut. The process is **fully automated** by [`python-semantic-release`](https://python-semantic-release.readthedocs.io/) and runs on every push to `master`. As the repo maintainer you do **not** edit version numbers, tag commits, or publish releases by hand — your job is to make sure each PR carries the correct metadata so the automation produces the right result.
+This document describes how a new version of `drove` is cut. The process is **fully automated** by [`python-semantic-release`](https://python-semantic-release.readthedocs.io/) and runs on every push to `main`. As the repo maintainer you do **not** edit version numbers, tag commits, or publish releases by hand — your job is to make sure each PR carries the correct metadata so the automation produces the right result.
 
 ## TL;DR
 
 1. Author a PR. Pick a [Conventional Commit](https://www.conventionalcommits.org/en/v1.0.0/) type for the **PR title**.
 2. Add a bullet to `CHANGELOG.md` under `## [Unreleased]`.
-3. **Squash-merge** to `master`.
+3. **Squash-merge** to `main`.
 4. The `Release` workflow bumps the version, rewrites the changelog, tags `vX.Y.Z`, and creates a GitHub Release.
 
 If you only want a checklist, jump to [Maintainer checklist](#maintainer-checklist).
@@ -17,7 +17,7 @@ If you only want a checklist, jump to [Maintainer checklist](#maintainer-checkli
 
 | Component | File | Purpose |
 |---|---|---|
-| Release workflow | `.github/workflows/release.yml` | Runs `python-semantic-release` on every push to `master`. |
+| Release workflow | `.github/workflows/release.yml` | Runs `python-semantic-release` on every push to `main`. |
 | PR-title lint | `.github/workflows/pr-title.yml` | Enforces Conventional Commits on PR titles via `amannn/action-semantic-pull-request@v6`. |
 | Semantic-release config | `pyproject.toml` (`[tool.semantic_release]`) | Defines how versions, tags, and the changelog are produced. |
 | Version source of truth | `pyproject.toml` → `project.version` | The field semantic-release rewrites. |
@@ -30,7 +30,7 @@ If you only want a checklist, jump to [Maintainer checklist](#maintainer-checkli
 
 ### 1a. PR title (drives the version bump)
 
-The squash-merge commit on `master` takes the **PR title**, and that commit message is what semantic-release parses. So the PR title alone determines whether a release is cut and what kind.
+The squash-merge commit on `main` takes the **PR title**, and that commit message is what semantic-release parses. So the PR title alone determines whether a release is cut and what kind.
 
 Allowed types (from `pr-title.yml` and `pyproject.toml:77`):
 
@@ -112,25 +112,25 @@ Rules:
 
 ---
 
-## Step 2 — Merge to `master`
+## Step 2 — Merge to `main`
 
 Use **Squash and merge**. This is what makes the PR title become the commit message that semantic-release parses.
 
 - Verify the squash-merge commit message in the GitHub merge dialog before clicking. GitHub may pre-fill it with the PR title (good) or with a list of all your branch commits (bad — semantic-release would parse those individually). Edit it down to the single Conventional Commit line if needed.
-- Do **not** push directly to `master`. Always go through a PR so the title lint runs.
-- Do **not** rebase- or merge-commit a feature branch into `master` unless every commit on that branch is itself a valid Conventional Commit; otherwise the parser may pick up unintended types.
+- Do **not** push directly to `main`. Always go through a PR so the title lint runs.
+- Do **not** rebase- or merge-commit a feature branch into `main` unless every commit on that branch is itself a valid Conventional Commit; otherwise the parser may pick up unintended types.
 
 ---
 
 ## Step 3 — What the Release workflow does
 
-`.github/workflows/release.yml` triggers on `push: branches: [master]` and runs `python-semantic-release/python-semantic-release@v9`. Configured by `[tool.semantic_release]` in `pyproject.toml`:
+`.github/workflows/release.yml` triggers on `push: branches: [main]` and runs `python-semantic-release/python-semantic-release@v9`. Configured by `[tool.semantic_release]` in `pyproject.toml`:
 
 1. **Inspects commits since the last `vX.Y.Z` tag.** If none of them imply a bump (e.g. only `chore:` / `docs:` / `style:` / `test:` / `ci:`), it exits and **no release is made**.
 2. **Computes the next version** based on the highest-impact commit (`feat!` > `feat` > `fix`/`perf`).
 3. **Rewrites `pyproject.toml`**: `project.version` → new version (`version_toml = ["pyproject.toml:project.version"]`).
 4. **Rewrites `CHANGELOG.md`**: moves the contents of `## [Unreleased]` into a new `## [X.Y.Z]` section, leaving `[Unreleased]` empty for the next cycle. Commits matching `^chore(\(.*\))?:`, `^ci…`, `^style…`, `^test…` are excluded from the auto-generated section (`pyproject.toml:69-74`).
-5. **Commits** the changes back to `master` with message:
+5. **Commits** the changes back to `main` with message:
 
    ```
    chore(release): vX.Y.Z
@@ -153,7 +153,7 @@ The job uses `permissions: contents: write` and the default `GITHUB_TOKEN`; no P
 Starting state: `pyproject.toml` says `version = "0.1.0"`, `CHANGELOG.md` has entries under `[Unreleased]`.
 
 1. You merge a PR titled `feat(cli): add models prune command`.
-2. GitHub pushes the squash commit to `master`.
+2. GitHub pushes the squash commit to `main`.
 3. `Release` workflow runs:
    - Sees a `feat:` commit since `v0.1.0` → next version is `0.2.0`.
    - Rewrites `pyproject.toml`: `version = "0.2.0"`.
@@ -172,7 +172,7 @@ Starting state: `pyproject.toml` says `version = "0.1.0"`, `CHANGELOG.md` has en
      +- `drove models prune` command that removes unreferenced GGUF files from the model store.
      ```
 
-   - Commits `chore(release): v0.2.0` to `master`.
+   - Commits `chore(release): v0.2.0` to `main`.
    - Tags `v0.2.0`.
    - Publishes GitHub Release `v0.2.0` with the changelog body.
 
@@ -215,8 +215,8 @@ The bump is governed by the highest-impact commit since the last tag. If a `feat
 **`CHANGELOG.md` ended up with an empty version section.**
 This happens when every commit since the last tag matched an excluded pattern (`chore`, `ci`, `style`, `test`). If a release was nonetheless cut (e.g. via a `feat:`/`fix:` mixed in), edit the changelog by hand in a follow-up `docs:` PR — do not retag.
 
-**I need to release urgently from a branch other than `master`.**
-Not supported by the current configuration: `[tool.semantic_release.branches.main]` matches only `main`/`master` (`pyproject.toml:64-66`). Land the change on `master` via a hotfix PR.
+**I need to release urgently from a branch other than `main`.**
+Not supported by the current configuration: `[tool.semantic_release.branches.main]` matches only `main` (`pyproject.toml:82-84`). Land the change on `main` via a hotfix PR.
 
 **I need to skip a release for a particular merge.**
 Use a non-bumping type (`chore:`, `docs:`, `refactor:`, etc.) for the PR title. The merge will still happen; no version will be cut.
@@ -229,6 +229,6 @@ Use a non-bumping type (`chore:`, `docs:`, `refactor:`, etc.) for the PR title. 
 - Add a `## [X.Y.Z]` heading or release date to `CHANGELOG.md`.
 - Create a `vX.Y.Z` git tag.
 - Create a GitHub Release.
-- Push directly to `master`.
+- Push directly to `main`.
 
 The automation owns all of these. Doing them by hand will desynchronise the version, tags, and changelog and confuse the next semantic-release run.

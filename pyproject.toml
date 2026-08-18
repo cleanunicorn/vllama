@@ -80,7 +80,7 @@ commit_message = "chore(release): v{version}\n\n[skip ci]"
 commit_parser = "conventional"
 
 [tool.semantic_release.branches.main]
-match = "(main|master)"
+match = "main"
 prerelease = false
 
 [tool.semantic_release.changelog]
