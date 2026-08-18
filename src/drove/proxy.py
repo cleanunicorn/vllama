@@ -64,6 +64,9 @@ def create_app(config: Config, config_path: Path | None = None) -> FastAPI:
             )
             _setup_sighup(_app, config_path)
 
+        # Drop prompt caches that outlived their TTL while drove was not running.
+        manager.prune_prompt_cache()
+
         try:
             yield
         finally:
