@@ -1,6 +1,77 @@
 # CHANGELOG
 
 
+## v0.5.0 (2026-08-18)
+
+### Documentation
+
+- Redesign README and refresh getting-started guide
+  ([`b00599a`](https://github.com/cleanunicorn/drove/commit/b00599a99e2ec35ff6e76251253fd06481b4f876))
+
+Rework the README into a modern, scannable landing page and expand the getting-started guide to
+  match. Both now document the full feature surface, including capabilities that were previously
+  undocumented.
+
+README: - Themed logo header, nav bar, "Why drove?" framing, 60-second quickstart - Feature table
+  and redrawn lazy-lifecycle diagram - Collapsible guides for text, vision, speech-to-text, chat,
+  observability, status, model management, and configuration - Complete command reference table and
+  HTTP endpoint list
+
+Getting started: - Prerequisites section (uv, llama-server, ffmpeg) - Three ways to send a first
+  request (chat, OpenAI SDK, curl) - New sections: speech-to-text, vision, model management,
+  terminal chat, server status, and observability - Cross-links to the other docs
+
+Docs-only; no code changes.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+### Features
+
+- **config**: Expose llama-server cache flags and an extra_args passthrough
+  ([`f9e1c96`](https://github.com/cleanunicorn/drove/commit/f9e1c965d01682a0c6df8f949f23a94f7dd86fb6))
+
+ModelConfig was a closed allowlist, so the flags that control prompt caching could not be set at all
+  — a sidecar key that is not declared is dropped silently.
+
+Adds cache_prompt, cache_reuse, cache_ram, ctx_checkpoints, context_shift, swa_full and load_mode,
+  plus an extra_args list that is appended verbatim after every generated argument (llama-server
+  takes the last occurrence of a flag, so these win). Booleans that llama-server exposes as a
+  --flag/--no-flag pair now emit the negated form when set to false instead of disappearing.
+
+Also fixes n_parallel, which emitted --n-parallel: llama-server rejects that outright ("error:
+  invalid argument: --n-parallel") and the model never started. It now maps to --parallel.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+- **server**: Keep the prompt cache across model sleep and wake
+  ([`dd30f38`](https://github.com/cleanunicorn/drove/commit/dd30f38595f051bd22b41ef8f35f66293e5963fd))
+
+llama-server keeps its prompt (KV) cache in RAM, and drove kills that process on every idle timeout
+  — so the first request after a model wakes re-processed the whole prompt.
+
+drove now saves each idle slot's KV cache through /slots?action=save before stopping a model and
+  restores it once the next process is healthy. Cache files older than prompt_cache_ttl_seconds
+  (default 1 hour) are deleted when drove starts and before each model start, which is what keeps
+  the directory bounded. On by default; set prompt_cache = false to opt out.
+
+Measured end to end on gemma-4-E4B, 20-token prompt: a cold request processes 20 tokens, and after
+  an idle shutdown and wake the same request processes 1 and reads 19 from cache.
+
+A restored cache is only reusable if the whole cache was serialized, so sliding-window models need
+  --swa-full — without it the restore reports success and yields zero reuse. That flag costs memory
+  (5.8 GB -> 7.0 GB at 32k context on gemma-4-E4B), so drove reads the GGUF header and adds it only
+  for models that declare a sliding window. A new minimal GGUF reader answers that question without
+  pulling in the gguf package; the answer is cached per file revision and read off the event loop,
+  since proving a model has no window means walking the tokenizer vocabulary.
+
+Also fixes _stop_instance cancelling the idle-watcher task that calls it. That was harmless while
+  SIGTERM was sent before the first await, but with a save step in front of it the CancelledError
+  fired first and left the llama-server process running — an orphaned model drove believed it had
+  stopped.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+
 ## v0.4.0 (2026-07-21)
 
 ### Documentation
