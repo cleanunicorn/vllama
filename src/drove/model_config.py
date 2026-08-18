@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
+import shlex
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, get_origin
 
 import tomli_w
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -21,6 +22,13 @@ class DownloadInfo(BaseModel):
 
 #: Config keys that drove consumes itself; excluded from llama-server args.
 _DROVE_ONLY_FIELDS = frozenset({"backend", "asr_model", "asr_quantization"})
+
+#: Boolean keys llama-server exposes as a ``--flag`` / ``--no-flag`` pair, where
+#: ``false`` must emit the negated flag instead of omitting the argument.
+_NEGATABLE_FIELDS = frozenset({"cache_prompt", "context_shift"})
+
+#: Keys whose llama-server flag is not the snake_case → --kebab-case default.
+_FLAG_OVERRIDES = {"n_parallel": "--parallel"}
 
 
 class ModelConfig(BaseModel):
@@ -44,7 +52,7 @@ class ModelConfig(BaseModel):
     # Batching
     batch_size: int | None = None
     ubatch_size: int | None = None
-    n_parallel: int | None = None
+    n_parallel: int | None = None  # → --parallel (number of server slots)
 
     # Sampling defaults
     temp: float | None = None
@@ -75,8 +83,23 @@ class ModelConfig(BaseModel):
     cache_type_k: str | None = None
     cache_type_v: str | None = None
 
+    # Prompt cache / KV reuse
+    cache_prompt: bool | None = None  # llama-server default: enabled
+    cache_reuse: int | None = None  # min chunk size reused via KV shifting (0 = off)
+    cache_ram: int | None = None  # MiB of RAM for the prompt cache (-1 = no limit, 0 = off)
+    ctx_checkpoints: int | None = None
+    context_shift: bool | None = None
+    swa_full: bool | None = None
+
+    # Model loading (auto, none, mmap, mlock, mmap+mlock, dio)
+    load_mode: str | None = None
+
     # Multimodal
     mmproj: str | None = None
+
+    # Escape hatch: raw llama-server arguments, appended last so they win over
+    # anything drove generated (e.g. ["--no-webui", "--lora", "/path/a.gguf"]).
+    extra_args: list[str] | None = None
 
     # Drove-specific settings (never passed to llama-server)
     backend: str | None = None  # "llama" (default) or "asr"
@@ -86,15 +109,23 @@ class ModelConfig(BaseModel):
     def to_llama_args(self) -> list[str]:
         """Convert config to llama-server CLI arguments."""
         args: list[str] = []
+        extra: list[str] = []
         for field, value in self.model_dump(exclude_none=True).items():
             if field in _DROVE_ONLY_FIELDS:
                 continue
-            flag = "--" + field.replace("_", "-")
+            if field == "extra_args":
+                extra = [str(v) for v in value]
+                continue
+            flag = _FLAG_OVERRIDES.get(field, "--" + field.replace("_", "-"))
             if isinstance(value, bool):
-                if value:
+                if field in _NEGATABLE_FIELDS:
+                    args.append(flag if value else "--no-" + flag.removeprefix("--"))
+                elif value:
                     args.append(flag)
             else:
                 args.extend([flag, str(value)])
+        # Raw passthrough goes last: llama-server takes the last occurrence of a flag.
+        args.extend(extra)
         return args
 
     def to_dict(self) -> dict[str, Any]:
@@ -127,6 +158,41 @@ def _validate_drove_key(key: str, value: str) -> None:
         )
 
 
+def _coerce_config_value(key: str, value: str) -> Any:
+    """Coerce a CLI string into the type declared for *key* on ``ModelConfig``.
+
+    Raises ValueError for unknown keys, so both the per-model and the global
+    setter reject typos the same way.
+    """
+    fields = ModelConfig.model_fields
+    if key not in fields:
+        valid = ", ".join(sorted(fields.keys()))
+        raise ValueError(f"Unknown config key '{key}'. Valid keys: {valid}")
+
+    _validate_drove_key(key, value)
+
+    annotation = fields[key].annotation
+    # Resolve Optional[X] → X
+    origin = getattr(annotation, "__origin__", None)
+    if origin is type(None):
+        raise ValueError(f"Cannot set NoneType field '{key}'")
+
+    args = getattr(annotation, "__args__", None)
+    inner = args[0] if args else annotation
+
+    if inner is bool:
+        return value.lower() in ("1", "true", "yes")
+    if inner is int:
+        return int(value)
+    if inner is float:
+        return float(value)
+    if get_origin(inner) is list:
+        # Shell-style splitting so a whole argument string can be pasted in:
+        #   drove models config mymodel extra_args "--lora /path/a.gguf"
+        return shlex.split(value)
+    return value
+
+
 GLOBAL_CONFIG_FILENAME = "_global.toml"
 
 
@@ -155,31 +221,7 @@ def save_global_model_config(models_dir: Path, config: ModelConfig) -> None:
 def set_global_model_config_key(models_dir: Path, key: str, value: str) -> ModelConfig:
     """Set a single key in the global model config, coercing the string value."""
     config = load_global_model_config(models_dir)
-    fields = ModelConfig.model_fields
-
-    if key not in fields:
-        valid = ", ".join(sorted(fields.keys()))
-        raise ValueError(f"Unknown config key '{key}'. Valid keys: {valid}")
-
-    _validate_drove_key(key, value)
-
-    annotation = fields[key].annotation
-    origin = getattr(annotation, "__origin__", None)
-    if origin is type(None):
-        raise ValueError(f"Cannot set NoneType field '{key}'")
-
-    args = getattr(annotation, "__args__", None)
-    inner = args[0] if args else annotation
-
-    if inner is bool:
-        coerced: Any = value.lower() in ("1", "true", "yes")
-    elif inner is int:
-        coerced = int(value)
-    elif inner is float:
-        coerced = float(value)
-    else:
-        coerced = value
-
+    coerced = _coerce_config_value(key, value)
     updated = config.model_copy(update={key: coerced})
     save_global_model_config(models_dir, updated)
     return updated
@@ -220,32 +262,7 @@ def save_model_config(model_path: Path, config: ModelConfig) -> None:
 def set_model_config_key(model_path: Path, key: str, value: str) -> ModelConfig:
     """Set a single key in the model config, coercing the string value to the right type."""
     config = load_model_config(model_path)
-    fields = ModelConfig.model_fields
-
-    if key not in fields:
-        valid = ", ".join(sorted(fields.keys()))
-        raise ValueError(f"Unknown config key '{key}'. Valid keys: {valid}")
-
-    _validate_drove_key(key, value)
-
-    annotation = fields[key].annotation
-    # Resolve Optional[X] → X
-    origin = getattr(annotation, "__origin__", None)
-    if origin is type(None):
-        raise ValueError(f"Cannot set NoneType field '{key}'")
-
-    args = getattr(annotation, "__args__", None)
-    inner = args[0] if args else annotation
-
-    if inner is bool:
-        coerced: Any = value.lower() in ("1", "true", "yes")
-    elif inner is int:
-        coerced = int(value)
-    elif inner is float:
-        coerced = float(value)
-    else:
-        coerced = value
-
+    coerced = _coerce_config_value(key, value)
     updated = config.model_copy(update={key: coerced})
     save_model_config(model_path, updated)
     return updated
